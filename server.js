@@ -12,10 +12,12 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcrypt';
 import session from 'express-session';
+import crypto from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
+app.set('trust proxy', 1); // behind LiteSpeed reverse proxy on cPanel
 const router = express.Router();
 const PORT = process.env.PORT || 3000;
 const TOKENS_DIR = path.join(__dirname, 'tokens');
@@ -93,6 +95,25 @@ function formatJid(number) {
     const digits = number.replace(/[^\d]/g, '');
     if (!digits || digits.length < 10) return null;
     return `${digits}@s.whatsapp.net`;
+}
+
+// API key auth middleware for external endpoints — SHA-256 hash in EXTERNAL_API_KEY_HASH
+function apiKeyAuth(req, res, next) {
+    const storedHash = process.env.EXTERNAL_API_KEY_HASH;
+    if (!storedHash) {
+        return res.status(500).json({ success: false, error: { code: 'api_key_not_configured', message: 'External API key not configured on server' } });
+    }
+    const provided = req.header('X-API-Key');
+    if (!provided) {
+        return res.status(401).json({ success: false, error: { code: 'missing_api_key', message: 'X-API-Key header is required' } });
+    }
+    const providedHash = crypto.createHash('sha256').update(provided).digest();
+    let storedBuf;
+    try { storedBuf = Buffer.from(storedHash, 'hex'); } catch { storedBuf = Buffer.alloc(0); }
+    if (storedBuf.length !== providedHash.length || !crypto.timingSafeEqual(storedBuf, providedHash)) {
+        return res.status(401).json({ success: false, error: { code: 'invalid_api_key', message: 'Invalid API key' } });
+    }
+    next();
 }
 
 // Validate URL to prevent SSRF — reject private/internal addresses
@@ -381,6 +402,96 @@ router.post('/api/logout', strictLimiter, async (req, res) => {
     }
 });
 
+// --- External API (API-key auth, no session, no rate limit) ---
+const externalRouter = express.Router();
+externalRouter.use(express.json());
+externalRouter.use(apiKeyAuth);
+
+function whatsappReady(res) {
+    if (!isAuthenticated || !sock) {
+        res.status(503).json({
+            success: false,
+            error: { code: 'whatsapp_not_authenticated', message: 'WhatsApp is not connected. QR code must be scanned by an admin.' },
+            connectionStatus,
+            hasQR: qrCodeData !== null,
+        });
+        return false;
+    }
+    return true;
+}
+
+externalRouter.post('/send-message', async (req, res) => {
+    if (!whatsappReady(res)) return;
+    const { number, message } = req.body || {};
+    if (!number || !message) {
+        return res.status(400).json({ success: false, error: { code: 'invalid_input', message: 'number and message are required' } });
+    }
+    if (typeof message !== 'string' || message.length > 4096) {
+        return res.status(400).json({ success: false, error: { code: 'invalid_input', message: 'message must be a string up to 4096 characters' } });
+    }
+    const jid = formatJid(number);
+    if (!jid) {
+        return res.status(400).json({ success: false, error: { code: 'invalid_number', message: 'Invalid phone number; provide digits with country code' } });
+    }
+    try {
+        const result = await sock.sendMessage(jid, { text: message });
+        res.json({ success: true, data: result });
+    } catch (error) {
+        console.error('External send-message error:', error);
+        res.status(500).json({ success: false, error: { code: 'send_failed', message: 'Failed to send message' } });
+    }
+});
+
+externalRouter.post('/send-image', async (req, res) => {
+    if (!whatsappReady(res)) return;
+    const { number, imageUrl, caption } = req.body || {};
+    if (!number || !imageUrl) {
+        return res.status(400).json({ success: false, error: { code: 'invalid_input', message: 'number and imageUrl are required' } });
+    }
+    if (!isUrlAllowed(imageUrl)) {
+        return res.status(400).json({ success: false, error: { code: 'invalid_image_url', message: 'Only public http(s) URLs are allowed' } });
+    }
+    if (caption && (typeof caption !== 'string' || caption.length > 1024)) {
+        return res.status(400).json({ success: false, error: { code: 'invalid_input', message: 'caption must be a string up to 1024 characters' } });
+    }
+    const jid = formatJid(number);
+    if (!jid) {
+        return res.status(400).json({ success: false, error: { code: 'invalid_number', message: 'Invalid phone number; provide digits with country code' } });
+    }
+    try {
+        const result = await sock.sendMessage(jid, { image: { url: imageUrl }, caption: caption || '' });
+        res.json({ success: true, data: result });
+    } catch (error) {
+        console.error('External send-image error:', error);
+        res.status(500).json({ success: false, error: { code: 'send_failed', message: 'Failed to send image' } });
+    }
+});
+
+externalRouter.post('/check-number', async (req, res) => {
+    if (!whatsappReady(res)) return;
+    const { number } = req.body || {};
+    if (!number) {
+        return res.status(400).json({ success: false, error: { code: 'invalid_input', message: 'number is required' } });
+    }
+    const digits = String(number).replace(/[^\d]/g, '');
+    if (digits.length < 10) {
+        return res.status(400).json({ success: false, error: { code: 'invalid_number', message: 'Invalid phone number; provide digits with country code' } });
+    }
+    try {
+        const [result] = await sock.onWhatsApp(digits);
+        res.json({
+            success: true,
+            data: {
+                numberExists: result?.exists || false,
+                id: result ? { user: result.jid?.replace('@s.whatsapp.net', '') } : null,
+            },
+        });
+    } catch (error) {
+        console.error('External check-number error:', error);
+        res.status(500).json({ success: false, error: { code: 'check_failed', message: 'Failed to check number' } });
+    }
+});
+
 // Security headers
 app.use(helmet({
     contentSecurityPolicy: {
@@ -392,6 +503,9 @@ app.use(helmet({
         },
     },
 }));
+
+// Mount external API router (no session, no rate limit) before the main router
+app.use((BASE_PATH || '') + '/api/external', externalRouter);
 
 // Mount router at base path or root
 if (BASE_PATH) app.use(BASE_PATH, router);
