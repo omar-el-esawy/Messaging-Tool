@@ -3,5 +3,3 @@ node_modules/
 tokens/
 *.data.json
 *.log
-.wwebjs_auth/
-.wwebjs_cache/

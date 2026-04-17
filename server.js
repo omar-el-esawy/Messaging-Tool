@@ -1,389 +1,415 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const wppconnect = require('@wppconnect-team/wppconnect');
-const QRCode = require('qrcode');
-const fs = require('fs');
-const path = require('path');
+// Load .env for local dev; on cPanel env vars are set via the panel
+try { await import('dotenv/config'); } catch {}
+import express from 'express';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } from 'baileys';
+import https from 'https';
+import QRCode from 'qrcode';
+import pino from 'pino';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import bcrypt from 'bcrypt';
+import session from 'express-session';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
+const router = express.Router();
 const PORT = process.env.PORT || 3000;
-const SESSION_NAME = process.env.SESSION_NAME || 'safqa-session';
+const TOKENS_DIR = path.join(__dirname, 'tokens');
+const BASE_PATH = process.env.BASE_PATH || '';
+
+// Rate limiting
+const generalLimiter = rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHeaders: false });
+const strictLimiter = rateLimit({ windowMs: 60_000, max: 5, standardHeaders: true, legacyHeaders: false });
 
 // Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static('public'));
+router.use(generalLimiter);
+router.use(express.json());
+router.use(session({
+    secret: process.env.SESSION_SECRET || 'fallback-dev-secret',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        maxAge: 86400000,
+        httpOnly: true,
+        secure: false,
+        sameSite: 'lax',
+    },
+}));
 
-// Global variables
-let client = null;
+// Auth middleware — public paths pass through, everything else requires session
+const PUBLIC_PATHS = ['/login.html', '/login.js', '/styles.css', '/api/login', '/api/auth-status'];
+router.use((req, res, next) => {
+    if (PUBLIC_PATHS.includes(req.path)) return next();
+    if (req.session && req.session.authenticated) return next();
+    if (req.path.startsWith('/api/')) {
+        return res.status(401).json({ success: false, error: 'Not authenticated' });
+    }
+    return res.redirect('login.html');
+});
+
+router.use(express.static(path.join(__dirname, 'public')));
+
+// Global state
+let sock = null;
 let qrCodeData = null;
 let isAuthenticated = false;
 let connectionStatus = 'disconnected';
+let initRetryCount = 0;
+const MAX_INIT_RETRIES = 3;
 
-// Clear old session tokens to force fresh QR code generation
+// Clear session tokens to force fresh QR code generation
 function clearSessionTokens() {
-    const tokensDir = path.join(__dirname, 'tokens');
-    if (fs.existsSync(tokensDir)) {
-        fs.rmSync(tokensDir, { recursive: true, force: true });
-        console.log('🗑️  Cleared old session tokens');
+    if (fs.existsSync(TOKENS_DIR)) {
+        fs.rmSync(TOKENS_DIR, { recursive: true, force: true });
+        console.log('Cleared old session tokens');
     }
 }
 
-// Initialize WPPConnect client
-async function initializeClient(forceNewSession = false) {
-    try {
-        // Reset state
-        qrCodeData = null;
-        isAuthenticated = false;
-        connectionStatus = 'connecting';
+// Fetch WA Web version using node:https (avoids undici WASM crash on shared hosting)
+// Mirrors Baileys' fetchLatestWaWebVersion: fetches sw.js and extracts client_revision
+function fetchWAVersion() {
+    return new Promise((resolve, reject) => {
+        https.get('https://web.whatsapp.com/sw.js', (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                const match = data.match(/client_revision.{0,5}?(\d{5,})/);
+                if (match) {
+                    resolve([2, 3000, Number(match[1])]);
+                } else {
+                    reject(new Error('Could not extract client_revision from sw.js'));
+                }
+            });
+        }).on('error', reject);
+    });
+}
 
-        if (forceNewSession) {
-            clearSessionTokens();
+// Format phone number to Baileys JID
+function formatJid(number) {
+    const digits = number.replace(/[^\d]/g, '');
+    if (!digits || digits.length < 10) return null;
+    return `${digits}@s.whatsapp.net`;
+}
+
+// Validate URL to prevent SSRF — reject private/internal addresses
+function isUrlAllowed(urlStr) {
+    try {
+        const parsed = new URL(urlStr);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+        const host = parsed.hostname.toLowerCase();
+        if (host === 'localhost' || host.endsWith('.local') || host === '[::1]') return false;
+        const parts = host.split('.').map(Number);
+        if (parts.length === 4 && parts.every(p => p >= 0 && p <= 255)) {
+            if (parts[0] === 10) return false;
+            if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
+            if (parts[0] === 192 && parts[1] === 168) return false;
+            if (parts[0] === 127) return false;
+            if (parts[0] === 169 && parts[1] === 254) return false;
+            if (parts[0] === 0) return false;
+        }
+        return true;
+    } catch { return false; }
+}
+
+// Initialize Baileys client
+async function initializeClient(forceNewSession = false) {
+    // Reset state
+    qrCodeData = null;
+    isAuthenticated = false;
+    connectionStatus = 'connecting';
+
+    if (forceNewSession) {
+        clearSessionTokens();
+    }
+
+    console.log('Initializing Baileys client...');
+
+    let version;
+    try {
+        version = await fetchWAVersion();
+        console.log('Fetched WA version:', version);
+    } catch (err) {
+        console.warn('Could not fetch WA version, using Baileys default:', err.message);
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(TOKENS_DIR);
+
+    sock = makeWASocket({
+        auth: state,
+        ...(version && { version }),
+        browser: Browsers.ubuntu('Chrome'),
+        logger: pino({ level: 'silent' }),
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            console.log('QR Code received');
+            qrCodeData = await QRCode.toDataURL(qr);
+            connectionStatus = 'qr_ready';
+            initRetryCount = 0;
         }
 
-        console.log('Initializing WPPConnect client...');
+        if (connection === 'open') {
+            console.log('WhatsApp connected successfully');
+            isAuthenticated = true;
+            qrCodeData = null;
+            connectionStatus = 'connected';
+            initRetryCount = 0;
+        }
 
-        client = await wppconnect.create({
-            session: SESSION_NAME,
-            catchQR: (base64Qr, asciiQR, attempts, urlCode) => {
-                console.log('📱 QR Code received, attempt:', attempts);
-                qrCodeData = base64Qr;
-                connectionStatus = 'qr_ready';
-            },
-            statusFind: (statusSession, session) => {
-                console.log('Status Session:', statusSession);
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const loggedOut = statusCode === DisconnectReason.loggedOut;
 
-                if (statusSession === 'isLogged' || statusSession === 'qrReadSuccess' || statusSession === 'chatsAvailable' || statusSession === 'inChat') {
-                    isAuthenticated = true;
-                    qrCodeData = null;
-                    connectionStatus = 'connected';
-                    console.log('✅ WhatsApp authenticated successfully!');
-                } else if (statusSession === 'notLogged' || statusSession === 'browserClose' || statusSession === 'qrReadError' || statusSession === 'autocloseCalled') {
-                    connectionStatus = statusSession;
-                } else {
-                    connectionStatus = statusSession;
-                }
-            },
-            headless: true,
-            devtools: false,
-            useChrome: false,
-            debug: false,
-            logQR: true,
-            browserArgs: [
-                '--disable-web-security',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-gpu',
-                '--disable-dev-shm-usage'
-            ],
-            autoClose: 0, // Disable auto-close so user has time to scan QR
-            deviceSyncTimeout: 0, // Disable device sync timeout (default 180s also triggers auto-close)
-            disableWelcome: true,
-            createPathFileToken: true,
-            folderNameToken: 'tokens',
-        });
+            console.log('Connection closed. Reason:', statusCode, loggedOut ? '(logged out)' : '');
 
-        console.log('✅ Client initialized successfully');
+            isAuthenticated = false;
+            connectionStatus = 'disconnected';
+            sock = null;
 
-        // Set up event listeners
-        client.onStateChange((state) => {
-            console.log('State changed:', state);
-            connectionStatus = state;
-            if (state === 'CONFLICT' && client) {
-                client.useHere();
+            if (loggedOut) {
+                clearSessionTokens();
+                initRetryCount = 0;
+                initializeClient(true);
+                return;
             }
-            if (state === 'CONNECTED') {
-                isAuthenticated = true;
-                qrCodeData = null;
+
+            // Non-logout disconnects: reconnect with retry limit
+            initRetryCount++;
+            if (initRetryCount <= MAX_INIT_RETRIES) {
+                console.log(`Reconnecting... (attempt ${initRetryCount}/${MAX_INIT_RETRIES})`);
+                initializeClient(false);
+            } else {
+                console.error(`Failed to connect after ${MAX_INIT_RETRIES} attempts. Use POST /api/restart to try again.`);
             }
-        });
-
-        client.onStreamChange((state) => {
-            console.log('Stream state:', state);
-        });
-
-        client.onIncomingCall(async (call) => {
-            console.log('Incoming call:', call);
-        });
-
-        return client;
-    } catch (error) {
-        console.error('❌ Error initializing client:', error.message);
-        connectionStatus = 'error';
-
-        // Auto-retry with fresh session if it failed
-        console.log('🔄 Retrying with fresh session in 5 seconds...');
-        setTimeout(() => {
-            initializeClient(true);
-        }, 5000);
-    }
+        }
+    });
 }
 
-// API Routes
+// --- API Routes ---
 
 // Get connection status
-app.get('/api/status', (req, res) => {
+router.get('/api/status', (req, res) => {
     res.json({
         status: connectionStatus,
         authenticated: isAuthenticated,
-        hasQR: qrCodeData !== null
+        hasQR: qrCodeData !== null,
     });
 });
 
 // Get QR Code
-app.get('/api/qr', async (req, res) => {
+router.get('/api/qr', (req, res) => {
+    if (isAuthenticated) {
+        return res.json({ success: false, message: 'Already authenticated', authenticated: true });
+    }
+    if (!qrCodeData) {
+        return res.json({ success: false, message: 'QR Code not ready yet. Please wait...', status: connectionStatus });
+    }
+    res.json({ success: true, qrCode: qrCodeData, authenticated: false });
+});
+
+// Login
+router.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    const adminUser = process.env.ADMIN_USERNAME;
+    const adminHash = process.env.ADMIN_PASSWORD_HASH;
+
+    if (!adminUser || !adminHash) {
+        console.error('ADMIN_USERNAME or ADMIN_PASSWORD_HASH not configured');
+        return res.status(500).json({ success: false, error: 'Server authentication not configured' });
+    }
+
+    if (!username || !password) {
+        return res.status(400).json({ success: false, error: 'Username and password are required' });
+    }
+
+    if (username !== adminUser) {
+        return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    }
+
     try {
-        if (isAuthenticated) {
-            return res.json({
-                success: false,
-                message: 'Already authenticated',
-                authenticated: true
-            });
+        const match = await bcrypt.compare(password, adminHash);
+        if (!match) {
+            return res.status(401).json({ success: false, error: 'Invalid credentials' });
         }
 
-        if (!qrCodeData) {
-            return res.json({
-                success: false,
-                message: 'QR Code not ready yet. Please wait...',
-                status: connectionStatus
-            });
-        }
-
-        res.json({
-            success: true,
-            qrCode: qrCodeData,
-            authenticated: false
-        });
+        req.session.authenticated = true;
+        res.json({ success: true, message: 'Login successful' });
     } catch (error) {
-        console.error('Error getting QR code:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error('Login error:', error);
+        res.status(500).json({ success: false, error: 'Login failed' });
     }
 });
 
+// Auth status check
+router.get('/api/auth-status', (req, res) => {
+    res.json({ authenticated: req.session && req.session.authenticated === true });
+});
+
 // Restart / re-initialize connection (force fresh QR)
-app.post('/api/restart', async (req, res) => {
+router.post('/api/restart', strictLimiter, async (req, res) => {
     try {
-        console.log('🔄 Restart requested...');
-        if (client) {
-            try {
-                await client.close();
-            } catch (e) {
-                console.log('Client close error (ignored):', e.message);
-            }
-            client = null;
+        console.log('Restart requested...');
+        if (sock) {
+            sock.end();
+            sock = null;
         }
         isAuthenticated = false;
         qrCodeData = null;
         connectionStatus = 'connecting';
+        initRetryCount = 0;
 
-        // Re-initialize with fresh session
         initializeClient(true);
 
-        res.json({
-            success: true,
-            message: 'Restarting connection... QR code will be available shortly.'
-        });
+        res.json({ success: true, message: 'Restarting connection... QR code will be available shortly.' });
     } catch (error) {
         console.error('Error restarting:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: 'Failed to restart' });
     }
 });
 
 // Send text message
-app.post('/api/send-message', async (req, res) => {
+router.post('/api/send-message', async (req, res) => {
     try {
-        if (!isAuthenticated || !client) {
-            return res.status(401).json({
-                success: false,
-                error: 'WhatsApp not authenticated. Please scan QR code first.'
-            });
+        if (!isAuthenticated || !sock) {
+            return res.status(401).json({ success: false, error: 'WhatsApp not authenticated. Please scan QR code first.' });
         }
 
         const { number, message } = req.body;
-
         if (!number || !message) {
-            return res.status(400).json({
-                success: false,
-                error: 'Number and message are required'
-            });
+            return res.status(400).json({ success: false, error: 'Number and message are required' });
+        }
+        if (message.length > 4096) {
+            return res.status(400).json({ success: false, error: 'Message too long (max 4096 characters)' });
         }
 
-        // Format number (remove spaces, dashes, etc.)
-        let formattedNumber = number.replace(/[^\d]/g, '');
-
-        // Validate number has enough digits
-        if (!formattedNumber || formattedNumber.length < 10) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid phone number. Please provide a valid number with country code (e.g., 201234567890)'
-            });
+        const jid = formatJid(number);
+        if (!jid) {
+            return res.status(400).json({ success: false, error: 'Invalid phone number. Please provide a valid number with country code (e.g., 201234567890)' });
         }
 
-        // Format with @c.us suffix
-        formattedNumber = `${formattedNumber}@c.us`;
+        console.log('Sending message to:', jid);
+        const result = await sock.sendMessage(jid, { text: message });
 
-        console.log('Sending message to:', formattedNumber);
-
-        // Send message
-        const result = await client.sendText(formattedNumber, message);
-
-        console.log('Message sent:', result);
-
-        res.json({
-            success: true,
-            message: 'Message sent successfully',
-            data: result
-        });
+        res.json({ success: true, message: 'Message sent successfully', data: result });
     } catch (error) {
         console.error('Error sending message:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: 'Failed to send message' });
     }
 });
 
 // Send message with image
-app.post('/api/send-image', async (req, res) => {
+router.post('/api/send-image', async (req, res) => {
     try {
-        if (!isAuthenticated || !client) {
-            return res.status(401).json({
-                success: false,
-                error: 'WhatsApp not authenticated'
-            });
+        if (!isAuthenticated || !sock) {
+            return res.status(401).json({ success: false, error: 'WhatsApp not authenticated' });
         }
 
         const { number, imageUrl, caption } = req.body;
-
         if (!number || !imageUrl) {
-            return res.status(400).json({
-                success: false,
-                error: 'Number and imageUrl are required'
-            });
+            return res.status(400).json({ success: false, error: 'Number and imageUrl are required' });
+        }
+        if (!isUrlAllowed(imageUrl)) {
+            return res.status(400).json({ success: false, error: 'Invalid image URL. Only public http/https URLs are allowed.' });
+        }
+        if (caption && caption.length > 1024) {
+            return res.status(400).json({ success: false, error: 'Caption too long (max 1024 characters)' });
         }
 
-        let formattedNumber = number.replace(/[^\d]/g, '');
-
-        // Validate number has enough digits
-        if (!formattedNumber || formattedNumber.length < 10) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid phone number. Please provide a valid number with country code (e.g., 201234567890)'
-            });
+        const jid = formatJid(number);
+        if (!jid) {
+            return res.status(400).json({ success: false, error: 'Invalid phone number. Please provide a valid number with country code (e.g., 201234567890)' });
         }
 
-        // Format with @c.us suffix
-        formattedNumber = `${formattedNumber}@c.us`;
+        console.log('Sending image to:', jid);
+        const result = await sock.sendMessage(jid, { image: { url: imageUrl }, caption: caption || '' });
 
-        console.log('Sending image to:', formattedNumber);
-
-        const result = await client.sendImage(
-            formattedNumber,
-            imageUrl,
-            'image',
-            caption || ''
-        );
-
-        res.json({
-            success: true,
-            message: 'Image sent successfully',
-            data: result
-        });
+        res.json({ success: true, message: 'Image sent successfully', data: result });
     } catch (error) {
         console.error('Error sending image:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: 'Failed to send image' });
     }
 });
 
-// Get contact info
-app.post('/api/check-number', async (req, res) => {
+// Check if number is registered on WhatsApp
+router.post('/api/check-number', async (req, res) => {
     try {
-        if (!isAuthenticated || !client) {
-            return res.status(401).json({
-                success: false,
-                error: 'WhatsApp not authenticated'
-            });
+        if (!isAuthenticated || !sock) {
+            return res.status(401).json({ success: false, error: 'WhatsApp not authenticated' });
         }
 
         const { number } = req.body;
-
         if (!number) {
-            return res.status(400).json({
-                success: false,
-                error: 'Number is required'
-            });
+            return res.status(400).json({ success: false, error: 'Number is required' });
         }
 
-        let formattedNumber = number.replace(/[^\d]/g, '');
-
-        const result = await client.checkNumberStatus(`${formattedNumber}@c.us`);
+        const digits = number.replace(/[^\d]/g, '');
+        const [result] = await sock.onWhatsApp(digits);
 
         res.json({
             success: true,
-            data: result
+            data: {
+                numberExists: result?.exists || false,
+                id: result ? { user: result.jid?.replace('@s.whatsapp.net', '') } : null,
+            },
         });
     } catch (error) {
         console.error('Error checking number:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: 'Failed to check number' });
     }
 });
 
-// Logout
-app.post('/api/logout', async (req, res) => {
+// Logout — connection.update handler handles cleanup + re-initialization on loggedOut
+router.post('/api/logout', strictLimiter, async (req, res) => {
     try {
-        if (client) {
-            await client.logout();
-            isAuthenticated = false;
-            qrCodeData = null;
-            connectionStatus = 'disconnected';
-            client = null;
-
-            // Reinitialize client
-            setTimeout(() => {
-                initializeClient();
-            }, 2000);
+        if (sock) {
+            await sock.logout();
         }
-
-        res.json({
-            success: true,
-            message: 'Logged out successfully'
-        });
+        req.session.destroy(() => {});
+        res.json({ success: true, message: 'Logged out successfully' });
     } catch (error) {
         console.error('Error logging out:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: 'Failed to logout' });
     }
 });
+
+// Security headers
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+            fontSrc: ["'self'", "https://fonts.gstatic.com"],
+            imgSrc: ["'self'", "data:"],
+        },
+    },
+}));
+
+// Mount router at base path or root
+if (BASE_PATH) app.use(BASE_PATH, router);
+else app.use('/', router);
 
 // Start server
 app.listen(PORT, async () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
-    console.log('📱 Initializing WhatsApp connection...');
-
-    // Initialize WPPConnect with existing session (if any) or generate new QR
+    console.log(`Server running on port ${PORT}`);
+    console.log('Initializing WhatsApp connection...');
     await initializeClient(false);
 });
 
-// Handle graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('\n⚠️ Shutting down gracefully...');
-    if (client) {
-        await client.close();
-    }
+// Export for Passenger compatibility
+export default app;
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\nShutting down...');
+    if (sock) sock.end();
     process.exit(0);
 });

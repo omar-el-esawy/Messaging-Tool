@@ -1,5 +1,6 @@
-// API Base URL
-const API_BASE = 'http://localhost:3000/api';
+// API Base URL — detect base path from current page location
+const BASE = window.location.pathname.replace(/\/+$/, '');
+const API_BASE = `${BASE}/api`;
 
 // DOM Elements
 const qrSection = document.getElementById('qrSection');
@@ -18,6 +19,14 @@ const checkResult = document.getElementById('checkResult');
 let isAuthenticated = false;
 let statusCheckInterval = null;
 let qrCheckInterval = null;
+let hasConnectionError = false;
+
+// Escape HTML to prevent XSS
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
 
 // Initialize app
 document.addEventListener('DOMContentLoaded', () => {
@@ -56,7 +65,12 @@ function setupEventListeners() {
 async function checkStatus() {
     try {
         const response = await fetch(`${API_BASE}/status`);
+        if (response.status === 401) {
+            window.location.href = `${BASE}/login.html`;
+            return;
+        }
         const data = await response.json();
+        hasConnectionError = false;
 
         updateStatus(data);
 
@@ -70,7 +84,10 @@ async function checkStatus() {
     } catch (error) {
         console.error('Error checking status:', error);
         updateStatusIndicator('disconnected', 'Connection Error');
-        showToast('error', 'Connection Error', 'Unable to connect to server');
+        if (!hasConnectionError) {
+            hasConnectionError = true;
+            showToast('error', 'Connection Error', 'Unable to connect to server');
+        }
     }
 }
 
@@ -126,6 +143,7 @@ function displayQRCode(qrCodeData) {
 
 // Show messaging section
 function showMessagingSection() {
+    if (messagingSection.style.display === 'block') return;
     qrSection.style.display = 'none';
     messagingSection.style.display = 'block';
     logoutBtn.style.display = 'flex';
@@ -306,14 +324,13 @@ async function handleCheckNumber(e) {
 
         if (data.success) {
             const result = data.data;
-            const isValid = result.numberExists || result.canReceiveMessage;
+            const isValid = result.numberExists;
 
             checkResult.className = `check-result show ${isValid ? 'success' : 'error'}`;
             checkResult.innerHTML = `
                 <h4>${isValid ? '✓ Valid WhatsApp Number' : '✗ Invalid Number'}</h4>
-                <p><strong>Number:</strong> ${result.id?.user || phoneNumber}</p>
+                <p><strong>Number:</strong> ${escapeHtml(result.id?.user || phoneNumber)}</p>
                 <p><strong>Status:</strong> ${result.numberExists ? 'Registered on WhatsApp' : 'Not registered'}</p>
-                ${result.isBusiness ? '<p><strong>Type:</strong> Business Account</p>' : ''}
             `;
 
             showToast(
@@ -325,7 +342,7 @@ async function handleCheckNumber(e) {
             checkResult.className = 'check-result show error';
             checkResult.innerHTML = `
                 <h4>✗ Check Failed</h4>
-                <p>${data.error || 'Unable to verify number'}</p>
+                <p>${escapeHtml(data.error || 'Unable to verify number')}</p>
             `;
             showToast('error', 'Check Failed', data.error || 'Unable to verify number');
         }
@@ -356,9 +373,7 @@ async function handleLogout() {
         const data = await response.json();
 
         if (data.success) {
-            showToast('info', 'Logged Out', 'Successfully logged out from WhatsApp');
-            showQRSection();
-            updateStatusIndicator('disconnected', 'Disconnected');
+            window.location.href = `${BASE}/login.html`;
         }
     } catch (error) {
         console.error('Error logging out:', error);
@@ -401,10 +416,10 @@ function showToast(type, title, message) {
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
     toast.innerHTML = `
-        ${icons[type]}
+        ${icons[type] || ''}
         <div class="toast-content">
-            <div class="toast-title">${title}</div>
-            <div class="toast-message">${message}</div>
+            <div class="toast-title">${escapeHtml(title)}</div>
+            <div class="toast-message">${escapeHtml(message)}</div>
         </div>
     `;
 

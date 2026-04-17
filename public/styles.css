@@ -314,6 +314,19 @@ body {
     to { transform: rotate(360deg); }
 }
 
+/* Login Card */
+.login-card {
+    max-width: 440px;
+}
+
+.login-card .qr-header {
+    text-align: center;
+}
+
+.login-card .logo-icon {
+    display: block;
+}
+
 .qr-code-container img {
     max-width: 100%;
     height: auto;
